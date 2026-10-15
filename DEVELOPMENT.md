@@ -1,10 +1,19 @@
 # FreeCAD AI Studio — Development
 
+## V10 — current
+
+- Permanent executable `freecad_studio.py`; version shown in title and header.
+- External `config.json` loaded on startup; sample `config.example.json` committed; local settings ignored by Git.
+- Native physical threads integrated via a dedicated new-block modelling tool (multiple holes, one common ISO metric size/pitch), not arbitrary LLM-authored helices.
+- No verified conversion of existing holes; avoid claiming it works until separately tested.
+- Validate against real FreeCAD 1.1.4 before calling physical threads production-ready.
+
+
 ## Baseline
 
 - V9: Native PartDesign::Hole M10 thread test and safeguard against unverified physical thread operations (requires live testing).
 - V8: Tkinter UI, dark theme, history, streaming, MCP interaction and bounded geometry verification.
-- Source entry point: `freecad_ollama_tk_v9.py` (V8 remains available).
+- Source entry point: `freecad_studio.py` (V8 and V9 remain available as historical versions).
 - Environment: FreeCAD MCP bridge on macOS; Ollama accessible via HTTP.
 
 ## Current priorities
