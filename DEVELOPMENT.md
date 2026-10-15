@@ -2,13 +2,14 @@
 
 ## Baseline
 
+- V9: Native PartDesign::Hole M10 thread test and safeguard against unverified physical thread operations (requires live testing).
 - V8: Tkinter UI, dark theme, history, streaming, MCP interaction and bounded geometry verification.
-- Source entry point: `freecad_ollama_tk_v8.py`.
+- Source entry point: `freecad_ollama_tk_v9.py` (V8 remains available).
 - Environment: FreeCAD MCP bridge on macOS; Ollama accessible via HTTP.
 
 ## Current priorities
 
-1. Validate V8 against the live FreeCAD bridge and record reproducible acceptance tests.
+1. Validate V9 native M10 modelled-thread test and then V8 against the live FreeCAD bridge and record reproducible acceptance tests.
 2. Strengthen rollback: independent saved-document checkpoints and restoration after failed geometry generation, rather than relying solely on undo transactions.
 3. Introduce an allowlist for generated Python operations and prevent destructive document closures without approval.
 4. Verify engineering thread annotations by standard, size, pitch, depth and correct feature linkage.
