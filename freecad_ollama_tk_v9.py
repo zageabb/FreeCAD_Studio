@@ -129,8 +129,8 @@ try:
     if iso is None: raise RuntimeError("No ISO metric thread option in this FreeCAD Hole feature")
     hole.ThreadType = iso
     sizes = enums("ThreadSize")
-    size = next((x for x in sizes if x.strip().upper() == "M10"), None)
-    if size is None: raise RuntimeError("M10 not offered by native thread feature: " + str(sizes))
+    size = next((x for x in sizes if x.strip().upper().replace(" ", "") in ("M10X1.5", "M10×1.5")), None)
+    if size is None: raise RuntimeError("M10x1.5 not offered by native thread feature: " + str(sizes))
     hole.ThreadSize = size
     if "ThreadDepth" in hole.PropertiesList: hole.ThreadDepth = 20
     if "Depth" in hole.PropertiesList: hole.Depth = 20
