@@ -697,7 +697,8 @@ class AgentBackend:
                             if await self.approval(NEW_DOCUMENT_CODE):
                                 out, failed = await self.call(mcp, "execute_python", {"code": NEW_DOCUMENT_CODE})
                                 if failed: raise RuntimeError(out[:500])
-                                await self.inspect(mcp)                                self.emit("assistant", text="New drawing created. Existing drawings were left open.")
+                                await self.inspect(mcp)
+                                self.emit("assistant", text="New drawing created. Existing drawings were left open.")
                             else:
                                 self.emit("log", text="New drawing cancelled")
                         elif kind == "thread_test":
