@@ -1,0 +1,15 @@
+{
+  "ollama": {
+    "url": "http://192.168.1.249:11434",
+    "model": "gpt-oss:120b-cloud",
+    "timeout_seconds": 240
+  },
+  "freecad": {
+    "mcp_url": "http://127.0.0.1:39280/mcp"
+  },
+  "agent": {
+    "max_tool_rounds": 6,
+    "max_corrections": 2,
+    "max_output_chars": 20000
+  }
+}
