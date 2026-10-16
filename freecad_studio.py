@@ -19,7 +19,7 @@ from ollama import AsyncClient
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 
-VERSION = "10.0.7"
+VERSION = "10.0.8"
 CONFIG_FILE = Path(__file__).resolve().parent / "config.json"
 DEFAULT_CONFIG = {
     "ollama": {"url": "http://192.168.1.249:11434", "model": "gpt-oss:120b-cloud", "timeout_seconds": 240},
@@ -145,6 +145,23 @@ d=App.getDocument(__DOC_NAME__) if __DOC_NAME__ else None
 if d is not None: d.abortTransaction(); d.recompute()
 print('STUDIO_TRANSACTION:rollback' if d else 'STUDIO_TRANSACTION:missing_document')""",
 }
+AI_DEMO_BRACKET_PROMPT = """Create ONE NEW FreeCAD document named AI_Bracket_Demo (use a unique name if that name exists). Build a 90-degree L bracket entirely by reasoning and generating FreeCAD Python through the MCP tools. Do not use a canned reference-demo routine.
+
+Specifications:
+- Overall envelope 40 x 40 x 40 mm, plates 2 mm thick.
+- Horizontal plate: box (40,40,2) at origin (0,0,0).
+- Upright plate: box (40,2,40) at origin (0,0,0).
+- Fuse the two plates to one solid. The fused base volume should be 6240 mm3.
+- Cut four vertical 5 mm diameter through-holes at (x,y)=(10,10),(30,10),(10,30),(30,30), cylinders along +Z from z=-4 for 10 mm.
+- Cut four horizontal 5 mm diameter through-holes at (x,z)=(10,10),(30,10),(10,30),(30,30), cylinders along +Y from y=-4 for 10 mm.
+- Name the final cut solid BracketFinal. Keep the construction tree concise; do not recreate the design or generate duplicate objects.
+- Final expected volume approximately 5925.84073 mm3; material removed approximately 314.15927 mm3; bounding box [40,40,40] mm.
+- Independently check that each cutter intersects the fused base by approximately 39.26991 mm3, and that none of that cutter's volume intersects the final result. Confirm single solid and shape.isValid().
+- Hide every construction shape and cutter, showing ONLY the final bracket solid. Set axonometric/isometric view and call Gui.activeDocument().activeView().fitAll().
+- Stop after the required model and checks are complete. Do not keep rebuilding to improve the names.
+Report measured results and distinguish any unsupported checks from verified ones.
+"""
+
 # Repeatable demo, independent of model tool-call limits.
 DEMO_BRACKET_CODE = r'''
 import FreeCAD as App, FreeCADGui as Gui, Part, json
@@ -1056,6 +1073,8 @@ class DesktopApp:
         self.new_btn.pack(side="left", padx=(0, 6))
         self.demo_btn = ttk.Button(bar, text="Demo Bracket", command=lambda: self._send_action("demo"))
         self.demo_btn.pack(side="left", padx=(0, 6))
+        self.ai_demo_btn = ttk.Button(bar, text="Demo Bracket (AI)", command=self._ai_demo)
+        self.ai_demo_btn.pack(side="left", padx=(0, 6))
         self.inspect_btn = ttk.Button(bar, text="Inspect Drawing", command=lambda: self._send_action("inspect"))
         self.inspect_btn.pack(side="left", padx=(0, 10))
         self.thread_test_btn = ttk.Button(bar, text="Test M10 Thread", command=lambda: self._send_action("thread_test"))
@@ -1141,6 +1160,12 @@ class DesktopApp:
             "verify": self.verify_var.get(), "correct": self.correct_var.get(),
             "debug": self.debug_var.get(), "thread_mode": self.thread_mode_var.get()})
 
+    def _ai_demo(self):
+        if self.busy or not self.connected: return
+        self.input.delete("1.0", "end")
+        self.input.insert("1.0", AI_DEMO_BRACKET_PROMPT)
+        self._send_message()
+
     def _send_message(self, event=None):
         if self.busy or not self.connected: return "break"
         text = self.input.get("1.0", "end").strip()
@@ -1164,7 +1189,7 @@ class DesktopApp:
     def _lock(self, busy):
         self.busy = busy
         status = "disabled" if (busy or not self.connected) else "normal"
-        for b in (self.new_btn, self.demo_btn, self.inspect_btn, self.thread_test_btn, self.send_btn): b.configure(state=status)
+        for b in (self.new_btn, self.demo_btn, self.ai_demo_btn, self.inspect_btn, self.thread_test_btn, self.send_btn): b.configure(state=status)
 
     def _poll(self):
         try:
