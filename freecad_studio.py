@@ -19,7 +19,7 @@ from ollama import AsyncClient
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 
-VERSION = "10.0.8"
+VERSION = "10.0.9"
 CONFIG_FILE = Path(__file__).resolve().parent / "config.json"
 DEFAULT_CONFIG = {
     "ollama": {"url": "http://192.168.1.249:11434", "model": "gpt-oss:120b-cloud", "timeout_seconds": 240},
@@ -520,11 +520,27 @@ class AgentBackend:
         self.correct = True
         self.debug = False
         self.thread_mode = "engineering"
+        self.model = MODEL
         self.pending_approvals = {}
         self.client = AsyncClient(host=OLLAMA_URL, timeout=float(CONFIG["ollama"]["timeout_seconds"]))
 
     def emit(self, kind, **fields):
         self.out.put((kind, fields))
+
+    async def refresh_models(self):
+        try:
+            response = await self.client.list()
+            models = sorted({
+                str(getattr(item, "model", "") or getattr(item, "name", ""))
+                for item in response.models
+                if getattr(item, "model", None) or getattr(item, "name", None)
+            })
+            if self.model not in models:
+                models.insert(0, self.model)
+            self.emit("models", models=models, selected=self.model)
+        except Exception as exc:
+            self.emit("models", models=[self.model], selected=self.model)
+            self.emit("log", text="Ollama model discovery failed: " + str(exc))
 
     async def call(self, mcp, name, args):
         result = await mcp.call_tool(name, arguments=args)
@@ -558,7 +574,7 @@ class AgentBackend:
             thinking_parts = []
             collected_calls = []
             try:
-                stream = await self.client.chat(model=MODEL, messages=messages,
+                stream = await self.client.chat(model=self.model, messages=messages,
                                                  tools=tools, stream=True,
                                                  options={"temperature": 0})
                 async for chunk in stream:
@@ -580,7 +596,7 @@ class AgentBackend:
                 self.emit("log", text="Ollama response failed; retrying this round once without streaming.")
                 try:
                     response = await self.client.chat(
-                        model=MODEL, messages=messages, tools=tools,
+                        model=self.model, messages=messages, tools=tools,
                         stream=False, options={"temperature": 0})
                 except Exception as retry_error:
                     raise RuntimeError(
@@ -786,7 +802,7 @@ class AgentBackend:
                       "Return status, summary, verified, issues, unverified, corrections as JSON"]}
         self.emit("status", text="Reviewing geometry")
         async def _request_verdict(streaming):
-            response = await self.client.chat(model=MODEL, format="json", stream=streaming,
+            response = await self.client.chat(model=self.model, format="json", stream=streaming,
                 messages=[{"role": "system", "content": "Conservative CAD verifier; produce exactly one complete JSON object."},
                           {"role": "user", "content": json.dumps(prompt, default=str)}],
                 options={"temperature": 0})
@@ -947,13 +963,20 @@ class AgentBackend:
                     "description": t.description or "", "parameters": t.input_schema}}
                     for t in usable]
                 self.emit("connection", connected=True, text="Connected to FreeCAD MCP")
+                await self.refresh_models()
                 while True:
                     command = await asyncio.to_thread(self.commands.get)
                     kind = command["kind"]
                     if kind == "quit": break
+                    if kind == "refresh_models":
+                        await self.refresh_models()
+                        continue
                     if kind == "settings":
                         for key in ("auto", "verify", "correct", "debug"):
                             if key in command: setattr(self, key, bool(command[key]))
+                        selected_model = command.get("model")
+                        if isinstance(selected_model, str) and selected_model.strip():
+                            self.model = selected_model.strip()
                         if command.get("thread_mode") in ("engineering", "physical"):
                             self.thread_mode = command["thread_mode"]
                         continue
@@ -1007,6 +1030,7 @@ class DesktopApp:
         self.correct_var = tk.BooleanVar(value=True)
         self.debug_var = tk.BooleanVar(value=False)
         self.thread_mode_var = tk.StringVar(value="engineering")
+        self.model_var = tk.StringVar(value=MODEL)
         self.status_var = tk.StringVar(value="Connecting to FreeCAD...")
         self.document_var = tk.StringVar(value="Document: —")
         self._layout()
@@ -1084,6 +1108,13 @@ class DesktopApp:
             ttk.Checkbutton(bar, text=name, variable=var, command=self._settings).pack(side="left", padx=6)
         mode_bar = ttk.Frame(wrapper)
         mode_bar.pack(fill="x", pady=(0, 8))
+        ttk.Label(mode_bar, text="Ollama model:").pack(side="left")
+        self.model_select = ttk.Combobox(mode_bar, textvariable=self.model_var,
+            state="readonly", width=25, values=[MODEL])
+        self.model_select.pack(side="left", padx=(8, 4))
+        self.model_select.bind("<<ComboboxSelected>>", lambda event: self._settings())
+        self.refresh_models_btn = ttk.Button(mode_bar, text="Refresh", command=self._refresh_models)
+        self.refresh_models_btn.pack(side="left", padx=(0, 15))
         ttk.Label(mode_bar, text="Thread mode:").pack(side="left")
         selector = ttk.Combobox(mode_bar, state="readonly", width=29,
             values=("Engineering threads (recommended)", "Physical threads (native — new blocks)"))
@@ -1153,12 +1184,18 @@ class DesktopApp:
         widget.see("end")
         widget.configure(state="disabled")
 
+    def _refresh_models(self):
+        if self.busy or not self.connected:
+            return
+        self.commands.put({"kind": "refresh_models"})
+
     def _settings(self):
         if not self.verify_var.get() and self.correct_var.get():
             self.correct_var.set(False)
         self.commands.put({"kind": "settings", "auto": self.auto_var.get(),
             "verify": self.verify_var.get(), "correct": self.correct_var.get(),
-            "debug": self.debug_var.get(), "thread_mode": self.thread_mode_var.get()})
+            "debug": self.debug_var.get(), "thread_mode": self.thread_mode_var.get(),
+            "model": self.model_var.get()})
 
     def _ai_demo(self):
         if self.busy or not self.connected: return
@@ -1189,7 +1226,8 @@ class DesktopApp:
     def _lock(self, busy):
         self.busy = busy
         status = "disabled" if (busy or not self.connected) else "normal"
-        for b in (self.new_btn, self.demo_btn, self.ai_demo_btn, self.inspect_btn, self.thread_test_btn, self.send_btn): b.configure(state=status)
+        for b in (self.new_btn, self.demo_btn, self.ai_demo_btn, self.inspect_btn, self.thread_test_btn, self.send_btn, self.refresh_models_btn): b.configure(state=status)
+        self.model_select.configure(state="readonly" if status == "normal" else "disabled")
 
     def _poll(self):
         try:
@@ -1199,6 +1237,10 @@ class DesktopApp:
                     self.connected = data["connected"]
                     self.status_var.set(data["text"])
                     self._lock(self.busy)
+                elif kind == "models":
+                    models = data["models"]
+                    self.model_select.configure(values=models)
+                    self.model_var.set(data["selected"])
                 elif kind == "busy": self._lock(data["busy"])
                 elif kind == "status":
                     self.status_var.set(data["text"])
