@@ -19,12 +19,12 @@ from ollama import AsyncClient
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 
-VERSION = "10.0.1"
+VERSION = "10.0.2"
 CONFIG_FILE = Path(__file__).resolve().parent / "config.json"
 DEFAULT_CONFIG = {
     "ollama": {"url": "http://192.168.1.249:11434", "model": "gpt-oss:120b-cloud", "timeout_seconds": 240},
     "freecad": {"mcp_url": "http://127.0.0.1:39280/mcp"},
-    "agent": {"max_tool_rounds": 6, "max_corrections": 2, "max_output_chars": 20000}
+    "agent": {"max_tool_rounds": 12, "max_corrections": 2, "max_output_chars": 20000}
 }
 
 def load_config():
@@ -514,8 +514,8 @@ class AgentBackend:
                 errors += int(failed)
                 messages.append({"role": "tool", "tool_name": name,
                                  "content": output[:MAX_OUTPUT_CHARS]})
-        self.emit("log", text="Tool-round limit reached")
-        return {"complete": False, "changes": changes, "errors": errors}
+        self.emit("log", text=f"Tool-round limit reached ({limit} rounds); inspecting geometry before deciding whether to commit.")
+        return {"complete": False, "changes": changes, "errors": errors, "limit_reached": True}
 
     async def test_native_thread(self, mcp):
         self.emit("status", text="Testing FreeCAD native M10 thread")
@@ -641,9 +641,13 @@ class AgentBackend:
             verdict.setdefault("issues", [])
             verdict["issues"] = list(verdict["issues"]) + issues
             verdict["summary"] = "Independent verification did not establish a correct final result. " + str(verdict.get("summary", ""))
-        if not outcome.get("complete") or outcome.get("errors",0):
+        if outcome.get("errors", 0):
             verdict["status"] = "fail"
-            verdict.setdefault("issues", []).append("Execution was incomplete or produced MCP errors")
+            verdict.setdefault("issues", []).append(f"{outcome['errors']} MCP/tool error(s) occurred")
+        elif not outcome.get("complete"):
+            if verdict["status"] == "pass":
+                verdict["status"] = "unknown"
+            verdict.setdefault("unverified", []).append("Tool-round limit reached before agent completion; do not auto-commit")
         self.emit("review", verdict=verdict)
         return verdict
 
