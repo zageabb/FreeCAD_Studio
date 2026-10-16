@@ -19,7 +19,7 @@ from ollama import AsyncClient
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 
-VERSION = "10.0.3"
+VERSION = "10.0.4"
 CONFIG_FILE = Path(__file__).resolve().parent / "config.json"
 DEFAULT_CONFIG = {
     "ollama": {"url": "http://192.168.1.249:11434", "model": "gpt-oss:120b-cloud", "timeout_seconds": 240},
@@ -137,15 +137,14 @@ d=App.ActiveDocument
 if d is not None: d.openTransaction('FreeCAD AI Studio operation')
 print('STUDIO_TRANSACTION:begin' if d else 'STUDIO_TRANSACTION:no_document')""",
     "commit": """import FreeCAD as App
-d=App.ActiveDocument
+d=App.getDocument(__DOC_NAME__) if __DOC_NAME__ else None
 if d is not None: d.commitTransaction()
-print('STUDIO_TRANSACTION:commit')""",
+print('STUDIO_TRANSACTION:commit' if d else 'STUDIO_TRANSACTION:missing_document')""",
     "rollback": """import FreeCAD as App
-d=App.ActiveDocument
+d=App.getDocument(__DOC_NAME__) if __DOC_NAME__ else None
 if d is not None: d.abortTransaction(); d.recompute()
-print('STUDIO_TRANSACTION:rollback')""",
+print('STUDIO_TRANSACTION:rollback' if d else 'STUDIO_TRANSACTION:missing_document')""",
 }
-
 # Fixed, isolated native FreeCAD Part Design thread test. The LLM does not generate
 # this geometry. Run this before attempting production physical-thread modelling.
 NATIVE_M10_TEST = r'''
@@ -577,9 +576,14 @@ class AgentBackend:
                       ". Your original document was left unchanged.")
         if self.debug: self.emit("log", text=json.dumps(report, indent=2))
 
-    async def transaction(self, mcp, action):
-        output, failed = await self.call(mcp, "execute_python", {"code": TRANSACTION_CODE[action]})
-        if failed or "STUDIO_TRANSACTION:" not in output:
+    async def transaction(self, mcp, action, document_name=None):
+        code = TRANSACTION_CODE[action]
+        if action != "begin":
+            if not document_name:
+                raise RuntimeError("Cannot finish transaction without originating document")
+            code = code.replace("__DOC_NAME__", repr(document_name))
+        output, failed = await self.call(mcp, "execute_python", {"code": code})
+        if failed or "STUDIO_TRANSACTION:" not in output or "STUDIO_TRANSACTION:missing_document" in output:
             raise RuntimeError(f"Transaction {action} failed: {output[:500]}")
         return "STUDIO_TRANSACTION:no_document" not in output
 
@@ -698,6 +702,7 @@ class AgentBackend:
             return
         self.emit("log", text=f"Thread mode: {mode}. Starting safeguarded operation.")
         guarded = False
+        originating_document = original.get("document")
         try:
             guarded = await self.transaction(mcp, "begin")
             if not guarded:
@@ -709,7 +714,7 @@ class AgentBackend:
             limit = 3 if mode == "physical" else MAX_TOOL_ROUNDS
             outcome = await self.action_phase(mcp, tools, messages, "Modelling", limit=limit)
             if not self.verify:
-                if guarded: await self.transaction(mcp, "commit")
+                if guarded: await self.transaction(mcp, "commit", originating_document)
                 self.emit("assistant", text="Modelling completed, but verification was disabled. No geometric success claim can be made.")
                 return
             verdict = None
@@ -718,7 +723,7 @@ class AgentBackend:
                 after = await self.inspect(mcp)
                 verdict = await self.review(instruction, original, after, outcome)
                 if verdict["status"] == "pass":
-                    if guarded: await self.transaction(mcp, "commit")
+                    if guarded: await self.transaction(mcp, "commit", originating_document)
                     self.emit("log", text="Verified operation committed.")
                     return
                 if (not self.correct or verdict["status"] == "unknown" or
@@ -730,15 +735,21 @@ class AgentBackend:
                     json.dumps(verdict) + "\nCURRENT MODEL:\n" + json.dumps(after) + "\n" + extra})
                 outcome = await self.action_phase(mcp, tools, messages, "Correcting", limit=3)
             if guarded:
-                await self.transaction(mcp, "rollback")
+                await self.transaction(mcp, "rollback", originating_document)
+                # A newly created document isn't covered by the transaction on
+                # the original document. Keep it visible for review rather than
+                # implying that its geometry has been rolled back.
+                if after.get("document") != originating_document:
+                    self.emit("assistant", text="Verification was inconclusive. Original drawing transaction reverted; NEW drawing " + str(after.get("document")) + " has been retained for manual inspection (not verified).")
+                else:
+                    self.emit("assistant", text="Verification did not pass. Original drawing changes were rolled back.")
                 await self.inspect(mcp)
-                self.emit("assistant", text="Verification did not pass. Changes were rolled back to the pre-operation document state (FreeCAD undo transaction).")
             else:
                 self.emit("assistant", text="Verification did not pass. No automatic rollback was available; inspect or restore the document before continuing.")
         except Exception:
             if guarded:
                 try:
-                    await self.transaction(mcp, "rollback")
+                    await self.transaction(mcp, "rollback", originating_document)
                     await self.inspect(mcp)
                     self.emit("log", text="Operation rolled back following an error.")
                 except Exception as rollback_error:
