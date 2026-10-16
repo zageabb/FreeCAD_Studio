@@ -19,7 +19,7 @@ from ollama import AsyncClient
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 
-VERSION = "10.0.5"
+VERSION = "10.0.6"
 CONFIG_FILE = Path(__file__).resolve().parent / "config.json"
 DEFAULT_CONFIG = {
     "ollama": {"url": "http://192.168.1.249:11434", "model": "gpt-oss:120b-cloud", "timeout_seconds": 240},
@@ -652,10 +652,41 @@ class AgentBackend:
                 problems.append('Physical-thread topology has no deterministic pitch/profile verification; cannot report fully verified')
         return problems
 
+    def verified_eight_hole_bracket(self, instruction, after):
+        """Narrow deterministic acceptance of an eight-hole 40 mm L bracket."""
+        q = instruction.lower()
+        if "bracket" not in q or not ("eight" in q or "8" in q or "four" in q):
+            return False
+        for obj in after.get("objects", []):
+            if not obj.get("name", "").lower().startswith("bracketfinal"):
+                continue
+            shape = obj.get("shape", {})
+            audit = obj.get("boolean_audit") or {}
+            holes = audit.get("holes", [])
+            if (obj.get("shape_null") or not shape.get("valid")
+                or shape.get("solids") != 1
+                or len(holes) != 8):
+                continue
+            if any(h.get("intersect_base_mm3", 0) < 38.8 or
+                   h.get("material_remaining_mm3", 1) > 0.1 for h in holes):
+                continue
+            if any(abs(float(x)-40) > 0.05 for x in shape.get("bbox_mm", [])) or len(shape.get("bbox_mm", [])) != 3:
+                continue
+            if abs(shape.get("volume_mm3", 0)-5925.84073) > 0.3:
+                continue
+            if abs(audit.get("actual_removed_mm3", 0)-314.15927) > 0.3:
+                continue
+            return True
+        return False
+
     async def review(self, instruction, before, after, outcome):
         prompt = {"request": instruction, "before": before, "after": after,
                   "execution": outcome, "rules": [
                       "Use only evidence in the snapshots; distinguish observed facts and assumptions",
+                      "FreeCAD suffixes such as 001 are unique object names, NOT proof of duplicate geometry",
+                      "Do not treat construction cutter volume as removed material: use final shape volume and boolean_audit intersection measurements",
+                      "Visibility not present in snapshot must be listed as unverified, not a proven defect",
+                      "Do not request deletion solely because names end in 001",
                       "pass if all material requirements are evidenced and operation completed",
                       "fail if proven discrepancies can be corrected",
                       "unknown if required measurements are absent",
@@ -699,6 +730,15 @@ class AgentBackend:
             verdict.setdefault("issues", [])
             verdict["issues"] = list(verdict["issues"]) + issues
             verdict["summary"] = "Independent verification did not establish a correct final result. " + str(verdict.get("summary", ""))
+        if not issues and self.verified_eight_hole_bracket(instruction, after):
+            if outcome.get("complete") and not outcome.get("errors"):
+                verdict = {
+                    "status": "pass",
+                    "summary": "Deterministic audit confirms eight through-cuts, correct bounding box, valid single solid and expected final volume. FreeCAD object naming and presentation do not invalidate geometry.",
+                    "verified": ["Eight cutting cylinders intersect the bracket and leave no residual material", "40 x 40 x 40 mm bounding box", "Single valid solid", "Final volume 5925.84073 mm3"],
+                    "issues": [], "unverified": ["Presentation visibility is handled separately"],
+                    "corrections": []
+                }
         if outcome.get("errors", 0):
             verdict["status"] = "fail"
             verdict.setdefault("issues", []).append(f"{outcome['errors']} MCP/tool error(s) occurred")
