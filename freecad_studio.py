@@ -19,7 +19,7 @@ from ollama import AsyncClient
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 
-VERSION = "10.0.4"
+VERSION = "10.0.5"
 CONFIG_FILE = Path(__file__).resolve().parent / "config.json"
 DEFAULT_CONFIG = {
     "ollama": {"url": "http://192.168.1.249:11434", "model": "gpt-oss:120b-cloud", "timeout_seconds": 240},
@@ -145,6 +145,39 @@ d=App.getDocument(__DOC_NAME__) if __DOC_NAME__ else None
 if d is not None: d.abortTransaction(); d.recompute()
 print('STUDIO_TRANSACTION:rollback' if d else 'STUDIO_TRANSACTION:missing_document')""",
 }
+# Deterministic view-only presentation; never changes model geometry.
+# Prefer a valid final Part::Cut/PartDesign feature, otherwise do not hide anything.
+PRESENT_MODEL_CODE = r'''
+import FreeCAD as App
+import FreeCADGui as Gui
+d=App.ActiveDocument
+if d is None:
+    print("STUDIO_PRESENT:no_document")
+else:
+    candidates=[]
+    for o in d.Objects:
+        if not hasattr(o, "Shape") or o.Shape.isNull() or not o.Shape.isValid():
+            continue
+        if len(o.Shape.Solids)!=1 or o.Shape.Volume<=0:
+            continue
+        if o.TypeId in ("Part::Cut","PartDesign::Hole","PartDesign::Pad","PartDesign::Pocket") or o.Name.lower().startswith(("bracketfinal","finalpart")):
+            candidates.append(o)
+    if candidates:
+        selected=candidates[-1]
+        for o in d.Objects:
+            if hasattr(o, "ViewObject") and o.ViewObject:
+                o.ViewObject.Visibility=(o.Name == selected.Name)
+        print("STUDIO_PRESENT:final=" + selected.Name)
+    else:
+        print("STUDIO_PRESENT:no_unambiguous_final;visibility_unchanged")
+    try:
+        Gui.activeDocument().activeView().viewAxonometric()
+        Gui.activeDocument().activeView().fitAll()
+        print("STUDIO_PRESENT:fit_all")
+    except Exception as e:
+        print("STUDIO_PRESENT:view_error=" + str(e))
+'''
+
 # Fixed, isolated native FreeCAD Part Design thread test. The LLM does not generate
 # this geometry. Run this before attempting production physical-thread modelling.
 NATIVE_M10_TEST = r'''
@@ -676,6 +709,17 @@ class AgentBackend:
         self.emit("review", verdict=verdict)
         return verdict
 
+    async def present_model(self, mcp):
+        """Frame latest final solid without altering geometry; record presentation errors."""
+        output, failed = await self.call(mcp, "execute_python", {"code": PRESENT_MODEL_CODE})
+        if failed:
+            self.emit("log", text="Fit All / presentation failed: " + output[:300])
+        elif "STUDIO_PRESENT:final=" in output:
+            self.emit("log", text="Final solid isolated and Fit All applied.")
+        elif "STUDIO_PRESENT:fit_all" in output:
+            self.emit("log", text="Fit All applied; final solid not unambiguously identified.")
+        return not failed
+
     async def perform(self, mcp, tools, instruction):
         self.emit("status", text="Inspecting existing drawing")
         original = await self.inspect(mcp)
@@ -698,6 +742,7 @@ class AgentBackend:
                 self.emit("assistant", text="Native thread operation completed. FreeCAD created a separate modelled-thread document; inspect the visible geometry in FreeCAD. Thread pitch topology has not been independently measured.")
             else:
                 self.emit("assistant", text="Native thread creation not completed or not verified. No original drawing was changed by the dedicated thread tool.")
+            await self.present_model(mcp)
             await self.inspect(mcp)
             return
         self.emit("log", text=f"Thread mode: {mode}. Starting safeguarded operation.")
@@ -724,6 +769,7 @@ class AgentBackend:
                 verdict = await self.review(instruction, original, after, outcome)
                 if verdict["status"] == "pass":
                     if guarded: await self.transaction(mcp, "commit", originating_document)
+                    await self.present_model(mcp)
                     self.emit("log", text="Verified operation committed.")
                     return
                 if (not self.correct or verdict["status"] == "unknown" or
