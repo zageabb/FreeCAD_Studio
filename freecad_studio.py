@@ -6,6 +6,7 @@ Run on the computer hosting the FreeCAD MCP bridge:
   python freecad_studio.py
 """
 import asyncio
+import ast
 import json
 import queue
 import re
@@ -19,7 +20,7 @@ from ollama import AsyncClient
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 
-VERSION = "10.0.9"
+VERSION = "10.1.0"
 CONFIG_FILE = Path(__file__).resolve().parent / "config.json"
 DEFAULT_CONFIG = {
     "ollama": {"url": "http://192.168.1.249:11434", "model": "gpt-oss:120b-cloud", "timeout_seconds": 240},
@@ -520,6 +521,7 @@ class AgentBackend:
         self.correct = True
         self.debug = False
         self.thread_mode = "engineering"
+        self.execution_mode = "auto"
         self.model = MODEL
         self.pending_approvals = {}
         self.client = AsyncClient(host=OLLAMA_URL, timeout=float(CONFIG["ollama"]["timeout_seconds"]))
@@ -562,6 +564,67 @@ class AgentBackend:
         response = queue.Queue(maxsize=1)
         self.emit("approval", code=code, response=response)
         return await asyncio.to_thread(response.get)
+
+    def python_preflight(self, code):
+        """Reject obviously unsafe model-generated code before presenting approval."""
+        if not code or len(code) > 30000:
+            raise ValueError("Generated script empty or excessively long")
+        tree = ast.parse(code)
+        forbidden = {"os", "sys", "subprocess", "socket", "urllib", "requests",
+                     "pathlib", "shutil", "pickle", "ctypes", "importlib", "builtins"}
+        forbidden_calls = {"eval", "exec", "compile", "open", "__import__", "input"}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                if any(a.name.split(".")[0] in forbidden for a in node.names):
+                    raise ValueError("Disallowed import in generated script")
+            elif isinstance(node, ast.ImportFrom):
+                if (node.module or "").split(".")[0] in forbidden:
+                    raise ValueError("Disallowed import in generated script")
+            elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in forbidden_calls:
+                raise ValueError("Disallowed Python call: " + node.func.id)
+            elif isinstance(node, ast.Attribute) and node.attr.startswith("__"):
+                raise ValueError("Dunder attribute access is disallowed")
+        return code
+
+    async def code_phase(self, mcp, instruction, snapshot):
+        """Controlled non-tool alternative: one generated script, explicit approval and MCP execution."""
+        self.emit("status", text="Generating FreeCAD Python")
+        instructions = (
+            "Write a single complete executable FreeCAD Python script to satisfy the user's CAD request. "
+            "Return ONLY Python source code, optionally in one ```python block; no explanations. "
+            "Use import FreeCAD as App, import Part, optionally import FreeCADGui as Gui. "
+            "Create or modify the requested geometry, recompute, hide all intermediate shapes, "
+            "set an isometric view and fitAll(). Avoid duplicate geometry. "
+            "Do not read files, access the internet, run shell commands or delete documents. "
+            "End after finishing the specified modelling task."
+        )
+        response = await self.client.chat(
+            model=self.model, messages=[
+                {"role": "system", "content": instructions},
+                {"role": "user", "content": "REQUEST:\\n" + instruction + "\\nCURRENT SNAPSHOT:\\n" + json.dumps(snapshot, default=str)}
+            ], stream=False, options={"temperature": 0})
+        raw = (response.message.content or "").strip()
+        match = re.search(r"```(?:python|py)?\\s*\\n(.*?)```", raw, re.S | re.I)
+        code = (match.group(1) if match else raw).strip()
+        if not code or (not match and ("```" in code or code.startswith("Here"))):
+            self.emit("log", text="Model returned no clean Python script; nothing executed.")
+            return {"complete": False, "changes": 0, "errors": 1}
+        try:
+            self.python_preflight(code)
+        except (SyntaxError, ValueError) as exc:
+            self.emit("log", text="Generated script failed preflight: " + str(exc))
+            return {"complete": False, "changes": 0, "errors": 1}
+        self.emit("log", text="Generated Python script; awaiting explicit approval before MCP execution.")
+        # Never bypass code review in this mode even with Auto execute selected.
+        response_queue = queue.Queue(maxsize=1)
+        self.emit("approval", code=code, response=response_queue)
+        if not await asyncio.to_thread(response_queue.get):
+            self.emit("log", text="Generated code execution declined.")
+            return {"complete": False, "changes": 0, "errors": 1}
+        output, failed = await self.call(mcp, "execute_python", {"code": code})
+        if failed:
+            self.emit("log", text="Generated script reported MCP error: " + output[:500])
+        return {"complete": True, "changes": 0 if failed else 1, "errors": int(failed)}
 
     async def action_phase(self, mcp, tools, messages, stage, limit=MAX_TOOL_ROUNDS):
         allowed = {t["function"]["name"] for t in tools}
@@ -614,6 +677,11 @@ class AgentBackend:
             if thinking_parts: assistant_msg["thinking"] = "".join(thinking_parts)
             messages.append(assistant_msg)
             if not collected_calls:
+                if self.execution_mode == "auto" and changes == 0:
+                    self.emit("log", text="Model supplied no native tool call; switching to Python generation.")
+                    initial_request = next((m.get("content", "") for m in messages if m.get("role") == "user"), "")
+                    result = await self.code_phase(mcp, initial_request, {})
+                    return result
                 return {"complete": True, "changes": changes, "errors": errors}
 
             for call in collected_calls:
@@ -906,7 +974,10 @@ class AgentBackend:
                     "\nEXISTING MODEL SNAPSHOT:\n" + json.dumps(original, default=str) +
                     "\n" + extra + "\nEdit existing objects, avoid duplicates."}]
             limit = 3 if mode == "physical" else MAX_TOOL_ROUNDS
-            outcome = await self.action_phase(mcp, tools, messages, "Modelling", limit=limit)
+            if self.execution_mode == "code":
+                outcome = await self.code_phase(mcp, instruction, original)
+            else:
+                outcome = await self.action_phase(mcp, tools, messages, "Modelling", limit=limit)
             if not self.verify:
                 if guarded: await self.transaction(mcp, "commit", originating_document)
                 self.emit("assistant", text="Modelling completed, but verification was disabled. No geometric success claim can be made.")
@@ -928,7 +999,10 @@ class AgentBackend:
                 self.emit("log", text=f"Correction {attempt+1}/{MAX_CORRECTIONS}")
                 messages.append({"role": "user", "content": "Fix only these discrepancies, no duplicate features:\n" +
                     json.dumps(verdict) + "\nCURRENT MODEL:\n" + json.dumps(after) + "\n" + extra})
-                outcome = await self.action_phase(mcp, tools, messages, "Correcting", limit=3)
+                if self.execution_mode == "code":
+                    outcome = await self.code_phase(mcp, "Correct these discrepancies without recreating the model: " + json.dumps(verdict), after)
+                else:
+                    outcome = await self.action_phase(mcp, tools, messages, "Correcting", limit=3)
             if guarded:
                 await self.transaction(mcp, "rollback", originating_document)
                 # A newly created document isn't covered by the transaction on
@@ -977,6 +1051,8 @@ class AgentBackend:
                         selected_model = command.get("model")
                         if isinstance(selected_model, str) and selected_model.strip():
                             self.model = selected_model.strip()
+                        if command.get("execution_mode") in ("auto", "native", "code"):
+                            self.execution_mode = command["execution_mode"]
                         if command.get("thread_mode") in ("engineering", "physical"):
                             self.thread_mode = command["thread_mode"]
                         continue
@@ -1031,6 +1107,7 @@ class DesktopApp:
         self.debug_var = tk.BooleanVar(value=False)
         self.thread_mode_var = tk.StringVar(value="engineering")
         self.model_var = tk.StringVar(value=MODEL)
+        self.execution_mode_var = tk.StringVar(value="Auto")
         self.status_var = tk.StringVar(value="Connecting to FreeCAD...")
         self.document_var = tk.StringVar(value="Document: —")
         self._layout()
@@ -1115,6 +1192,11 @@ class DesktopApp:
         self.model_select.bind("<<ComboboxSelected>>", lambda event: self._settings())
         self.refresh_models_btn = ttk.Button(mode_bar, text="Refresh", command=self._refresh_models)
         self.refresh_models_btn.pack(side="left", padx=(0, 15))
+        ttk.Label(mode_bar, text="Execution:").pack(side="left")
+        self.execution_select = ttk.Combobox(mode_bar, textvariable=self.execution_mode_var,
+            state="readonly", width=16, values=("Auto", "Native Tools", "Generate Python"))
+        self.execution_select.pack(side="left", padx=(6, 12))
+        self.execution_select.bind("<<ComboboxSelected>>", lambda event: self._settings())
         ttk.Label(mode_bar, text="Thread mode:").pack(side="left")
         selector = ttk.Combobox(mode_bar, state="readonly", width=29,
             values=("Engineering threads (recommended)", "Physical threads (native — new blocks)"))
@@ -1195,7 +1277,8 @@ class DesktopApp:
         self.commands.put({"kind": "settings", "auto": self.auto_var.get(),
             "verify": self.verify_var.get(), "correct": self.correct_var.get(),
             "debug": self.debug_var.get(), "thread_mode": self.thread_mode_var.get(),
-            "model": self.model_var.get()})
+            "model": self.model_var.get(),
+            "execution_mode": {"Auto": "auto", "Native Tools": "native", "Generate Python": "code"}[self.execution_mode_var.get()]})
 
     def _ai_demo(self):
         if self.busy or not self.connected: return
@@ -1228,6 +1311,7 @@ class DesktopApp:
         status = "disabled" if (busy or not self.connected) else "normal"
         for b in (self.new_btn, self.demo_btn, self.ai_demo_btn, self.inspect_btn, self.thread_test_btn, self.send_btn, self.refresh_models_btn): b.configure(state=status)
         self.model_select.configure(state="readonly" if status == "normal" else "disabled")
+        self.execution_select.configure(state="readonly" if status == "normal" else "disabled")
 
     def _poll(self):
         try:
