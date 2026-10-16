@@ -614,6 +614,7 @@ class AgentBackend:
         except (SyntaxError, ValueError) as exc:
             self.emit("log", text="Generated script failed preflight: " + str(exc))
             return {"complete": False, "changes": 0, "errors": 1}
+        self.emit("log", text="Generated Python script for review (" + str(len(code)) + " characters).")
         self.emit("log", text="Generated Python script; awaiting explicit approval before MCP execution.")
         # Never bypass code review in this mode even with Auto execute selected.
         response_queue = queue.Queue(maxsize=1)
@@ -916,6 +917,9 @@ class AgentBackend:
                     "issues": [], "unverified": ["Presentation visibility is handled separately"],
                     "corrections": []
                 }
+        if not outcome.get("changes", 0) and not outcome.get("errors", 0):
+            verdict["status"] = "unknown"
+            verdict.setdefault("unverified", []).append("No modelling command was executed through MCP")
         if outcome.get("errors", 0):
             verdict["status"] = "fail"
             verdict.setdefault("issues", []).append(f"{outcome['errors']} MCP/tool error(s) occurred")
