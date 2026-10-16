@@ -8,7 +8,7 @@
     "mcp_url": "http://127.0.0.1:39280/mcp"
   },
   "agent": {
-    "max_tool_rounds": 6,
+    "max_tool_rounds": 12,
     "max_corrections": 2,
     "max_output_chars": 20000
   }
