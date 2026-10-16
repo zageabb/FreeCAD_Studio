@@ -19,7 +19,7 @@ from ollama import AsyncClient
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 
-VERSION = "10.0.0"
+VERSION = "10.0.1"
 CONFIG_FILE = Path(__file__).resolve().parent / "config.json"
 DEFAULT_CONFIG = {
     "ollama": {"url": "http://192.168.1.249:11434", "model": "gpt-oss:120b-cloud", "timeout_seconds": 240},
@@ -92,6 +92,30 @@ def _snap():
             try:
                 item["constraints"] = [{"type": c.Type, "value": _n(c.Value)} for c in o.Constraints]
             except Exception as e: item["errors"].append(str(e))
+        if o.TypeId == "Part::Cut":
+            try:
+                base = o.Base
+                cutter_group = o.Tool
+                cutters = list(getattr(cutter_group, "Links", []) or [cutter_group])
+                audit = {"base": base.Name, "tool": cutter_group.Name, "holes": []}
+                expected_removal = 0.0
+                for cutter in cutters:
+                    if cutter.TypeId != "Part::Cylinder":
+                        continue
+                    intersection = base.Shape.common(cutter.Shape).Volume
+                    remainder = o.Shape.common(cutter.Shape).Volume
+                    expected_removal += intersection
+                    audit["holes"].append({
+                        "name": cutter.Name,
+                        "intersect_base_mm3": _n(intersection),
+                        "material_remaining_mm3": _n(remainder)
+                    })
+                if audit["holes"]:
+                    audit["expected_removed_mm3"] = _n(expected_removal)
+                    audit["actual_removed_mm3"] = _n(base.Shape.Volume - o.Shape.Volume)
+                    item["boolean_audit"] = audit
+            except Exception as e:
+                item["boolean_audit_error"] = str(e)
         report["objects"].append(item)
     return report
 print("FREECAD_SNAPSHOT_JSON:" + json.dumps(_snap(), default=str))
@@ -547,6 +571,17 @@ class AgentBackend:
             shape = o.get("shape", {})
             if o.get("shape_null") or not shape.get("valid", False) or shape.get("solids", 0) < 1 or shape.get("volume_mm3", 0) <= 0:
                 problems.append(f"{o['name']} is not a valid positive-volume solid")
+        for o in objs:
+            audit = o.get("boolean_audit")
+            if not audit:
+                continue
+            for hole in audit.get("holes", []):
+                if hole["intersect_base_mm3"] < 1.0:
+                    problems.append(f"{o['name']}: {hole['name']} does not cut the base solid")
+                elif hole["material_remaining_mm3"] > 0.1:
+                    problems.append(f"{o['name']}: {hole['name']} is not fully removed from the result")
+            if abs(audit.get("expected_removed_mm3", 0) - audit.get("actual_removed_mm3", 0)) > 0.2:
+                problems.append(f"{o['name']}: expected cut volume {audit['expected_removed_mm3']} mm³ but actual removal is {audit['actual_removed_mm3']} mm³")
         if re.search(r"\bthread(?:ed|s|ing)?\b|\bM\d+(?:\s*[x×]\s*\d+(?:\.\d+)?)?\b", instruction, re.I):
             if self.thread_mode == "engineering":
                 annotated = [o for o in objs if str(o.get('properties',{}).get('ThreadRepresentation','')).lower() == 'engineering'
@@ -568,20 +603,36 @@ class AgentBackend:
                       "unknown if required measurements are absent",
                       "Return status, summary, verified, issues, unverified, corrections as JSON"]}
         self.emit("status", text="Reviewing geometry")
-        stream = await self.client.chat(model=MODEL, format="json", stream=True,
-            messages=[{"role": "system", "content": "Conservative CAD verifier; JSON only."},
-                      {"role": "user", "content": json.dumps(prompt, default=str)}],
-            options={"temperature": 0})
-        chunks = []
-        async for chunk in stream:
-            token = chunk.message.content or ""
-            chunks.append(token)
-            if self.debug: self.emit("token", text=token)
-        try:
-            verdict = json.loads("".join(chunks))
-            if not isinstance(verdict, dict): raise ValueError()
-        except (ValueError, TypeError):
-            verdict = {"status": "unknown", "summary": "Review response was not valid JSON"}
+        async def _request_verdict(streaming):
+            response = await self.client.chat(model=MODEL, format="json", stream=streaming,
+                messages=[{"role": "system", "content": "Conservative CAD verifier; produce exactly one complete JSON object."},
+                          {"role": "user", "content": json.dumps(prompt, default=str)}],
+                options={"temperature": 0})
+            if streaming:
+                chunks = []
+                async for chunk in response:
+                    token = chunk.message.content or ""
+                    chunks.append(token)
+                    if self.debug: self.emit("token", text=token)
+                raw = "".join(chunks)
+            else:
+                raw = response.message.content or ""
+            try:
+                value = json.loads(raw)
+                if not isinstance(value, dict):
+                    raise ValueError("Review was not an object")
+                return value
+            except (ValueError, TypeError):
+                if self.debug: self.emit("log", text="Malformed verification JSON: " + raw[:1000])
+                return None
+
+        verdict = await _request_verdict(True)
+        if verdict is None:
+            self.emit("log", text="Verification response malformed; retrying without streaming.")
+            verdict = await _request_verdict(False)
+        if verdict is None:
+            verdict = {"status": "unknown", "summary": "Review response was not valid JSON after retry",
+                       "issues": [], "verified": [], "unverified": ["LLM review unavailable"], "corrections": []}
         if verdict.get("status") not in ("pass", "fail", "unknown"):
             verdict["status"] = "unknown"
         issues = self.hard_checks(instruction, after)
