@@ -19,7 +19,7 @@ from ollama import AsyncClient
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 
-VERSION = "10.0.2"
+VERSION = "10.0.3"
 CONFIG_FILE = Path(__file__).resolve().parent / "config.json"
 DEFAULT_CONFIG = {
     "ollama": {"url": "http://192.168.1.249:11434", "model": "gpt-oss:120b-cloud", "timeout_seconds": 240},
@@ -454,20 +454,41 @@ class AgentBackend:
             content_parts = []
             thinking_parts = []
             collected_calls = []
-            stream = await self.client.chat(model=MODEL, messages=messages,
-                                             tools=tools, stream=True,
-                                             options={"temperature": 0})
-            async for chunk in stream:
-                msg = chunk.message
-                if getattr(msg, "content", None):
-                    content_parts.append(msg.content)
-                    self.emit("token", text=msg.content)
-                if getattr(msg, "thinking", None):
-                    thinking_parts.append(msg.thinking)
-                    if self.debug: self.emit("log", text=msg.thinking)
-                for tool_call in (getattr(msg, "tool_calls", None) or []):
-                    # The Ollama streaming API emits distinct complete tool calls.
-                    collected_calls.append(tool_call.model_dump(exclude_none=True))
+            try:
+                stream = await self.client.chat(model=MODEL, messages=messages,
+                                                 tools=tools, stream=True,
+                                                 options={"temperature": 0})
+                async for chunk in stream:
+                    msg = chunk.message
+                    if getattr(msg, "content", None):
+                        content_parts.append(msg.content)
+                        self.emit("token", text=msg.content)
+                    if getattr(msg, "thinking", None):
+                        thinking_parts.append(msg.thinking)
+                        if self.debug: self.emit("log", text=msg.thinking)
+                    for tool_call in (getattr(msg, "tool_calls", None) or []):
+                        collected_calls.append(tool_call.model_dump(exclude_none=True))
+            except Exception as exc:
+                # A failed stream may contain partial tokens/calls. Discard ALL
+                # partial results and retry once without streaming; no MCP
+                # action has been executed for this round yet.
+                if type(exc).__name__ != "ResponseError":
+                    raise
+                self.emit("log", text="Ollama response failed; retrying this round once without streaming.")
+                try:
+                    response = await self.client.chat(
+                        model=MODEL, messages=messages, tools=tools,
+                        stream=False, options={"temperature": 0})
+                except Exception as retry_error:
+                    raise RuntimeError(
+                        "Ollama failed both streamed and non-streamed requests; "
+                        "operation will be rolled back. " + str(retry_error)
+                    ) from retry_error
+                content_parts = [response.message.content or ""]
+                thinking_parts = [response.message.thinking] if getattr(response.message, "thinking", None) else []
+                collected_calls = [c.model_dump(exclude_none=True)
+                                   for c in (response.message.tool_calls or [])]
+                self.emit("log", text="Ollama fallback response received.")
 
             assistant_msg = {"role": "assistant", "content": "".join(content_parts)}
             if collected_calls: assistant_msg["tool_calls"] = collected_calls
