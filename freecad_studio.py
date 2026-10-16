@@ -601,10 +601,10 @@ class AgentBackend:
         response = await self.client.chat(
             model=self.model, messages=[
                 {"role": "system", "content": instructions},
-                {"role": "user", "content": "REQUEST:\\n" + instruction + "\\nCURRENT SNAPSHOT:\\n" + json.dumps(snapshot, default=str)}
+                {"role": "user", "content": "REQUEST:\n" + instruction + "\nCURRENT SNAPSHOT:\n" + json.dumps(snapshot, default=str)}
             ], stream=False, options={"temperature": 0})
         raw = (response.message.content or "").strip()
-        match = re.search(r"```(?:python|py)?\\s*\\n(.*?)```", raw, re.S | re.I)
+        match = re.search(r"```(?:python|py)?\s*\n(.*?)```", raw, re.S | re.I)
         code = (match.group(1) if match else raw).strip()
         if not code or (not match and ("```" in code or code.startswith("Here"))):
             self.emit("log", text="Model returned no clean Python script; nothing executed.")
