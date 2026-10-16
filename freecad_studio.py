@@ -19,7 +19,7 @@ from ollama import AsyncClient
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 
-VERSION = "10.0.6"
+VERSION = "10.0.7"
 CONFIG_FILE = Path(__file__).resolve().parent / "config.json"
 DEFAULT_CONFIG = {
     "ollama": {"url": "http://192.168.1.249:11434", "model": "gpt-oss:120b-cloud", "timeout_seconds": 240},
@@ -145,6 +145,60 @@ d=App.getDocument(__DOC_NAME__) if __DOC_NAME__ else None
 if d is not None: d.abortTransaction(); d.recompute()
 print('STUDIO_TRANSACTION:rollback' if d else 'STUDIO_TRANSACTION:missing_document')""",
 }
+# Repeatable demo, independent of model tool-call limits.
+DEMO_BRACKET_CODE = r'''
+import FreeCAD as App, FreeCADGui as Gui, Part, json
+from datetime import datetime
+doc=None
+report={"status":"fail","errors":[]}
+try:
+    name="AI_BracketDemo_"+datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    doc=App.newDocument(name)
+    horizontal=Part.makeBox(40,40,2,App.Vector(0,0,0))
+    upright=Part.makeBox(40,2,40,App.Vector(0,0,0))
+    bracket=horizontal.fuse(upright).removeSplitter()
+    cutters=[]
+    for x in (10,30):
+        for y in (10,30):
+            cutters.append(Part.makeCylinder(2.5,10,App.Vector(x,y,-4),App.Vector(0,0,1)))
+    for x in (10,30):
+        for z in (10,30):
+            cutters.append(Part.makeCylinder(2.5,10,App.Vector(x,-4,z),App.Vector(0,1,0)))
+    intersections=[bracket.common(c).Volume for c in cutters]
+    cut=bracket.cut(Part.makeCompound(cutters)).removeSplitter()
+    bb=cut.BoundBox
+    check={
+        "solid_valid":not cut.isNull() and cut.isValid(),
+        "solid_count":len(cut.Solids),
+        "base_volume_mm3":round(bracket.Volume,5),
+        "final_volume_mm3":round(cut.Volume,5),
+        "removed_volume_mm3":round(bracket.Volume-cut.Volume,5),
+        "bbox_mm":[round(bb.XLength,4),round(bb.YLength,4),round(bb.ZLength,4)],
+        "intersections_mm3":[round(v,5) for v in intersections],
+        "all_cuts_applied":all(cut.common(c).Volume < 0.1 for c in cutters)
+    }
+    if (not check["solid_valid"] or check["solid_count"]!=1 or
+        any(abs(v-40)>0.05 for v in check["bbox_mm"]) or
+        abs(check["base_volume_mm3"]-6240)>0.05 or
+        abs(check["final_volume_mm3"]-5925.84073)>0.2 or
+        any(abs(v-39.269908)>0.2 for v in intersections) or
+        not check["all_cuts_applied"]):
+        raise RuntimeError("Demo geometry failed independent validation")
+    obj=doc.addObject("PartDesign::Feature","BracketFinal")
+    obj.Shape=cut
+    doc.recompute()
+    App.setActiveDocument(doc.Name)
+    Gui.activeDocument().activeView().viewAxonometric()
+    Gui.activeDocument().activeView().fitAll()
+    report={"status":"pass","document":doc.Name,"checks":check}
+except Exception as e:
+    report["errors"].append(type(e).__name__+": "+str(e))
+    if doc is not None:
+        try: App.closeDocument(doc.Name)
+        except Exception: pass
+print("STUDIO_DEMO_JSON:"+json.dumps(report))
+'''
+
 # Deterministic view-only presentation; never changes model geometry.
 # Prefer a valid final Part::Cut/PartDesign feature, otherwise do not hide anything.
 PRESENT_MODEL_CODE = r'''
@@ -570,6 +624,28 @@ class AgentBackend:
         self.emit("log", text=f"Tool-round limit reached ({limit} rounds); inspecting geometry before deciding whether to commit.")
         return {"complete": False, "changes": changes, "errors": errors, "limit_reached": True}
 
+    async def demo_bracket(self, mcp):
+        self.emit("status", text="Building eight-hole bracket demo")
+        self.emit("log", text="Creating an isolated 40 mm bracket with four 5 mm through-holes on each face.")
+        if not await self.approval(DEMO_BRACKET_CODE):
+            self.emit("assistant", text="Bracket demo cancelled.")
+            return
+        raw, failed = await self.call(mcp, "execute_python", {"code": DEMO_BRACKET_CODE})
+        try:
+            report = parse_marked_json(raw, "STUDIO_DEMO_JSON:")
+        except Exception as exc:
+            raise RuntimeError("Demo did not return a verifiable result: " + str(exc))
+        if failed or report.get("status") != "pass":
+            self.emit("assistant", text="Bracket demo FAILED: " + "; ".join(report.get("errors", ["MCP error"])))
+        else:
+            checks = report["checks"]
+            self.emit("assistant", text=(
+                "Demo bracket verified in " + report["document"] +
+                ". Eight actual through-cuts, one valid solid; removed volume " +
+                str(checks["removed_volume_mm3"]) + " mm³; final volume " +
+                str(checks["final_volume_mm3"]) + " mm³. Isometric view and Fit All applied."))
+            await self.inspect(mcp)
+
     async def test_native_thread(self, mcp):
         self.emit("status", text="Testing FreeCAD native M10 thread")
         self.emit("log", text="Isolated M10x1.5 physical thread test; existing drawings untouched.")
@@ -874,6 +950,8 @@ class AgentBackend:
                                 self.emit("assistant", text="New drawing created. Existing drawings were left open.")
                             else:
                                 self.emit("log", text="New drawing cancelled")
+                        elif kind == "demo":
+                            await self.demo_bracket(mcp)
                         elif kind == "thread_test":
                             await self.test_native_thread(mcp)
                         elif kind == "inspect":
@@ -976,6 +1054,8 @@ class DesktopApp:
         bar.pack(fill="x", pady=(0, 8))
         self.new_btn = ttk.Button(bar, text="＋ New Drawing", command=lambda: self._send_action("new"))
         self.new_btn.pack(side="left", padx=(0, 6))
+        self.demo_btn = ttk.Button(bar, text="Demo Bracket", command=lambda: self._send_action("demo"))
+        self.demo_btn.pack(side="left", padx=(0, 6))
         self.inspect_btn = ttk.Button(bar, text="Inspect Drawing", command=lambda: self._send_action("inspect"))
         self.inspect_btn.pack(side="left", padx=(0, 10))
         self.thread_test_btn = ttk.Button(bar, text="Test M10 Thread", command=lambda: self._send_action("thread_test"))
@@ -1084,7 +1164,7 @@ class DesktopApp:
     def _lock(self, busy):
         self.busy = busy
         status = "disabled" if (busy or not self.connected) else "normal"
-        for b in (self.new_btn, self.inspect_btn, self.send_btn): b.configure(state=status)
+        for b in (self.new_btn, self.demo_btn, self.inspect_btn, self.thread_test_btn, self.send_btn): b.configure(state=status)
 
     def _poll(self):
         try:
