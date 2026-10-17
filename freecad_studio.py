@@ -20,7 +20,7 @@ from ollama import AsyncClient
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 
-VERSION = "10.1.0"
+VERSION = "10.1.1"
 CONFIG_FILE = Path(__file__).resolve().parent / "config.json"
 DEFAULT_CONFIG = {
     "ollama": {"url": "http://192.168.1.249:11434", "model": "gpt-oss:120b-cloud", "timeout_seconds": 240},
@@ -622,9 +622,25 @@ class AgentBackend:
         if not await asyncio.to_thread(response_queue.get):
             self.emit("log", text="Generated code execution declined.")
             return {"complete": False, "changes": 0, "errors": 1}
-        output, failed = await self.call(mcp, "execute_python", {"code": code})
+        # Capture document identities before execution, then activate the single
+        # newly-created nonempty document, if one exists, for trustworthy inspection.
+        wrapped = (
+            "import FreeCAD as __studio_app\\n"
+            "__studio_before=set(__studio_app.listDocuments())\\n"
+            + code + "\\n"
+            "__studio_new=[d for name,d in __studio_app.listDocuments().items() "
+            "if name not in __studio_before and len(d.Objects)>0]\\n"
+            "if len(__studio_new)==1:\\n"
+            "    __studio_app.setActiveDocument(__studio_new[0].Name)\\n"
+            "print('STUDIO_GENERATED_DOCUMENT:'+"
+            "(__studio_app.ActiveDocument.Name if __studio_app.ActiveDocument else 'none'))\\n"
+        )
+        output, failed = await self.call(mcp, "execute_python", {"code": wrapped})
         if failed:
             self.emit("log", text="Generated script reported MCP error: " + output[:500])
+        else:
+            self.emit("log", text="Generated execution finished; inspecting actual active document.")
+
         return {"complete": True, "changes": 0 if failed else 1, "errors": int(failed)}
 
     async def action_phase(self, mcp, tools, messages, stage, limit=MAX_TOOL_ROUNDS):
@@ -903,6 +919,20 @@ class AgentBackend:
         if verdict.get("status") not in ("pass", "fail", "unknown"):
             verdict["status"] = "unknown"
         issues = self.hard_checks(instruction, after)
+        # Missing geometric evidence is a hard stop, even when a model invents
+        # detailed dimensions and claims PASS in its textual review.
+        if not after.get("objects"):
+            verdict = {
+                "status": "unknown",
+                "summary": "No objects were found in the inspected FreeCAD document. No bracket dimensions, volumes or holes have been verified.",
+                "verified": [],
+                "issues": [],
+                "unverified": ["CAD geometry and active document; inspect the actual model"],
+                "corrections": []
+            }
+            self.emit("review", verdict=verdict)
+            return verdict
+
         if issues:
             verdict["status"] = "unknown" if self.thread_mode == "physical" and all('Physical-thread' in x for x in issues) else "fail"
             verdict.setdefault("issues", [])
