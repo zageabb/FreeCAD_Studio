@@ -625,15 +625,15 @@ class AgentBackend:
         # Capture document identities before execution, then activate the single
         # newly-created nonempty document, if one exists, for trustworthy inspection.
         wrapped = (
-            "import FreeCAD as __studio_app\\n"
-            "__studio_before=set(__studio_app.listDocuments())\\n"
-            + code + "\\n"
+            "import FreeCAD as __studio_app\n"
+            "__studio_before=set(__studio_app.listDocuments())\n"
+            + code + "\n"
             "__studio_new=[d for name,d in __studio_app.listDocuments().items() "
-            "if name not in __studio_before and len(d.Objects)>0]\\n"
-            "if len(__studio_new)==1:\\n"
-            "    __studio_app.setActiveDocument(__studio_new[0].Name)\\n"
+            "if name not in __studio_before and len(d.Objects)>0]\n"
+            "if len(__studio_new)==1:\n"
+            "    __studio_app.setActiveDocument(__studio_new[0].Name)\n"
             "print('STUDIO_GENERATED_DOCUMENT:'+"
-            "(__studio_app.ActiveDocument.Name if __studio_app.ActiveDocument else 'none'))\\n"
+            "(__studio_app.ActiveDocument.Name if __studio_app.ActiveDocument else 'none'))\n"
         )
         output, failed = await self.call(mcp, "execute_python", {"code": wrapped})
         if failed:
